@@ -1,6 +1,8 @@
 import { createId } from "@paralleldrive/cuid2";
 import type { ResumeProjectCatalogItem } from "@shared/types";
 import { stripHtmlTags } from "@shared/utils/string";
+import { marked } from "marked";
+import sanitizeHtml from "sanitize-html";
 
 type RecordLike = Record<string, unknown>;
 
@@ -61,25 +63,92 @@ export function applyTailoredHeadline(
   basics.label = headline;
 }
 
+// Tags allowed in tailored rich-text fields. Matches the Tiptap extension
+// surface that RxResume v5 PDF templates render correctly. Headings, links,
+// images, scripts, and styles are stripped (text content kept where present).
+const RICH_TEXT_ALLOWED_TAGS = [
+  "p",
+  "br",
+  "strong",
+  "em",
+  "u",
+  "s",
+  "ul",
+  "ol",
+  "li",
+  "code",
+  "blockquote",
+];
+
+// Configure marked once at module load. GFM gives us list/strikethrough
+// support; `breaks: true` mirrors Tiptap's behavior of treating a single
+// newline as a `<br>` (Tiptap's "hardBreak" extension).
+marked.setOptions({ gfm: true, breaks: true });
+
+// RxResume v5 spec requires rich-text fields (summary.content, skills
+// description, experience.summary, etc.) to be HTML strings because the
+// editor (Tiptap) and the PDF templates render them via dangerouslySetInnerHTML.
+// The LLM emits markdown-flavored plain text, so writing it raw makes the PDF
+// fall back to browser default typography (or render literal `**asterisks**`)
+// instead of inheriting the template's `<p>` styling.
+//
+// Pipeline: trim -> passthrough if already valid HTML -> markdown to HTML
+// (marked) -> sanitize against the Tiptap-allowed tag whitelist (sanitize-html).
+export function toRichTextHtml(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+
+  // Passthrough for content that is already wrapped HTML. Detect by matching
+  // an opening tag with a corresponding closing tag from the allowed set.
+  // Avoids false positives like "C++ <dev>" or "List<Integer>" in plain text.
+  const openTag =
+    /<(p|br|strong|em|u|s|ul|ol|li|h[1-6]|span|div|a|b|i|code|blockquote)\b[^>]*>/i;
+  const closeTag =
+    /<\/(p|strong|em|u|s|ul|ol|li|h[1-6]|span|div|a|b|i|code|blockquote)>/i;
+  if (openTag.test(trimmed) && closeTag.test(trimmed)) {
+    return sanitizeHtml(trimmed, {
+      allowedTags: RICH_TEXT_ALLOWED_TAGS,
+      allowedAttributes: {},
+    });
+  }
+
+  const rendered =
+    typeof marked.parse === "function"
+      ? (marked.parse(trimmed, { async: false }) as string)
+      : "";
+  const sanitized = sanitizeHtml(rendered, {
+    allowedTags: RICH_TEXT_ALLOWED_TAGS,
+    allowedAttributes: {},
+  });
+  return sanitized.trim();
+}
+
+// Backwards-compatible alias. Prefer `toRichTextHtml` in new code.
+export function toSummaryHtml(value: string): string {
+  return toRichTextHtml(value);
+}
+
 export function applyTailoredSummary(
   resumeData: RecordLike,
   summary?: string | null,
 ): void {
   if (!summary) return;
+  const html = toRichTextHtml(summary);
+  if (!html) return;
   const topSummary = asRecord(resumeData.summary);
   if (topSummary) {
     if (
       typeof topSummary.content === "string" ||
       topSummary.content === undefined
     ) {
-      topSummary.content = summary;
+      topSummary.content = html;
       return;
     }
     if (
       typeof topSummary.value === "string" ||
       topSummary.value === undefined
     ) {
-      topSummary.value = summary;
+      topSummary.value = html;
       return;
     }
   }
@@ -87,7 +156,7 @@ export function applyTailoredSummary(
   const sections = asRecord(resumeData.sections);
   const summarySection = asRecord(sections?.summary);
   if (summarySection) {
-    summarySection.content = summary;
+    summarySection.content = html;
     return;
   }
 }
@@ -135,12 +204,13 @@ export function applyTailoredSkills(
     }
 
     if ("description" in next) {
-      next.description =
+      const rawDescription =
         typeof newSkill.description === "string"
           ? newSkill.description
           : typeof match.description === "string"
             ? match.description
             : "";
+      next.description = rawDescription ? toRichTextHtml(rawDescription) : "";
     }
     if ("proficiency" in next) {
       next.proficiency =
